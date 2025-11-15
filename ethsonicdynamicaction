@@ -1,0 +1,689 @@
+// SPDX-License-Identifier: MIT
+pragma solidity =0.7.6;
+pragma abicoder v2;
+
+import {OracleLibrary} from "@uniswap/v3-periphery/contracts/libraries/OracleLibrary.sol";
+import {IRateProvider} from "./interfaces/IRateProvider.sol";
+import {IChainlinkOracle} from "./interfaces/IChainlinkOracle.sol";
+import {IERC20} from "./interfaces/IERC20.sol";
+
+/**
+ * @title WETHRateProvider
+ * @notice Rate provider for Balancer stable pools with anti-manipulation protection
+ * @dev Protects small pools from arbitrage exploitation using graduated deviation response,
+ *      exponential backoff, and asymmetric thresholds
+ * 
+ * SECURITY MODEL:
+ * - Uses Uniswap V3 TWAP as primary price source (manipulation-resistant)
+ * - Cross-validates with Chainlink for large deviations
+ * - Asymmetric thresholds: stricter when WETH being bought (vulnerable state)
+ * - Exponential backoff: repeated attacks face geometric cooldown increases
+ * - Timelock on threshold changes: prevents owner from front-running users
+ */
+contract WETHRateProvider is IRateProvider {
+    // ============ IMMUTABLE CONFIGURATION ============
+    
+    /// @notice Scaling factor to normalize Chainlink decimals to 18
+    uint256 public immutable chainlinkDecimalScalingFactor;
+
+    /// @notice Uniswap V3 WETH/USDC pool used for TWAP oracle (Sonic network)
+    address constant WETH_POOL = 0x6Fb30F3FCB864D49cdff15061ed5c6ADFEE40B40;
+    
+    /// @notice Token addresses on Sonic network
+    address constant WETH = 0x50c42dEAcD8Fc9773493ED674b675bE577f2634b;
+    address constant USDC = 0x29219dd400f2Bf60E5a23d13Be72B486D4038894;
+    
+    /// @notice Chainlink WETH/USD price feed on Sonic network
+    address constant WETH_CHAINLINK_ORACLE = 0x824364077993847f71293B24ccA8567c00c2de11;
+    
+    /// @notice TWAP window in seconds (30s = standard for manipulation resistance)
+    uint32 constant TWAP_INTERVAL = 30;
+    
+    // ============ OWNERSHIP ============
+    
+    /// @notice Contract owner (can update parameters within safe bounds)
+    address public owner;
+    
+    // ============ BLENDING CONFIGURATION ============
+    
+    /// @notice Weight for TWAP in warning-level blended rate (80%)
+    uint256 private constant BLEND_TWAP_WEIGHT = 8000;
+    
+    /// @notice Weight for Chainlink in warning-level blended rate (20-30% dynamic)
+    uint256 private constant BLEND_CHAINLINK_WEIGHT = 2000;
+    
+    /// @notice Divisor for basis point calculations
+    uint256 private constant BLEND_DIVISOR = 10000;
+    
+    // ============ TIMELOCK CONFIGURATION ============
+    
+    /// @notice Delay before threshold updates take effect (~10 minutes)
+    /// @dev Prevents owner from front-running users with parameter changes
+    uint256 public constant THRESHOLD_UPDATE_DELAY = 50; // blocks at 12s = 600s
+    
+    /// @notice Pending threshold update (awaiting timelock expiry)
+    struct PendingThresholds {
+        uint256 warnBuy;        // Warn threshold when WETH being bought
+        uint256 warnSell;       // Warn threshold when WETH being sold
+        uint256 moderateBuy;    // Moderate threshold when buying
+        uint256 moderateSell;   // Moderate threshold when selling
+        uint256 severe;         // Severe threshold (symmetric)
+        uint256 effectiveBlock; // Block when update can be executed
+    }
+    
+    PendingThresholds public pendingThresholds;
+    bool public hasPendingThresholds;
+    
+    // ============ DEVIATION THRESHOLDS (Basis Points) ============
+    
+    /**
+     * @notice Asymmetric deviation thresholds for graduated response
+     * @dev Tighter when TWAP > Chainlink (WETH being bought = pool vulnerable)
+     *      Looser when TWAP < Chainlink (WETH being sold = less risk)
+     * 
+     * WARNING LEVEL: Blend TWAP + Chainlink (70-80% TWAP, 20-30% Chainlink)
+     * MODERATE LEVEL: Use Chainlink only + enter cooldown
+     * SEVERE LEVEL: Revert transaction (symmetric threshold)
+     */
+    
+    /// @notice Warn threshold when WETH being bought (0.30% = 30 bps)
+    uint256 public deviationWarnBuy = 30;
+    
+    /// @notice Warn threshold when WETH being sold (0.50% = 50 bps)
+    uint256 public deviationWarnSell = 50;
+    
+    /// @notice Moderate threshold when WETH being bought (0.60% = 60 bps)
+    uint256 public deviationModerateBuy = 60;
+    
+    /// @notice Moderate threshold when WETH being sold (0.90% = 90 bps)
+    uint256 public deviationModerateSell = 90;
+    
+    /// @notice Severe threshold - revert transaction (1.50% = 150 bps, symmetric)
+    uint256 public deviationSevere = 150;
+    
+    // ============ COOLDOWN CONFIGURATION ============
+    
+    /**
+     * @notice Duration to block rate updates after deviation detected
+     * @dev Prevents repeated arbitrage attacks by forcing cooldown period
+     *      where only cached Chainlink rate is returned
+     */
+    
+    /// @notice Cooldown after moderate deviation (~15 min at 12s blocks)
+    uint256 public cooldownBlocksModerate = 75;
+    
+    /// @notice Cooldown after severe deviation (~40 min at 12s blocks)
+    uint256 public cooldownBlocksSevere = 200;
+    
+    // ============ EXPONENTIAL BACKOFF CONFIGURATION ============
+    
+    /**
+     * @notice Exponential backoff multiplies cooldowns for repeated attacks
+     * @dev Tracks deviations in rolling window, applies geometric penalty
+     *      Example: 1st attack = 75 blocks, 2nd = 150, 3rd = 225, 4th+ = 300
+     */
+    
+    /// @notice Window to track deviation events (300 blocks = ~1 hour)
+    uint256 public constant BACKOFF_WINDOW = 300;
+    
+    /// @notice Maximum cooldown multiplier (caps at 4x)
+    uint256 public constant MAX_BACKOFF_MULTIPLIER = 4;
+    
+    // ============ CHAINLINK CONFIGURATION ============
+    
+    /// @notice Maximum age of Chainlink price before considered stale (1 hour)
+    uint256 public chainlinkStalenessThreshold = 3600;
+    
+    // ============ STATE VARIABLES ============
+    
+    /**
+     * @notice Cooldown enforcement state
+     * @dev When deviation detected, enters cooldown where only cached Chainlink rate returned
+     */
+    
+    /// @notice Block number of last deviation event (0 = no active cooldown)
+    uint256 public lastDeviationBlock;
+    
+    /// @notice Severity level of last deviation (0=none, 1=moderate, 2=severe)
+    uint256 public lastDeviationLevel;
+    
+    /// @notice Cached Chainlink rate from last deviation event
+    uint256 public cachedSafeRate;
+    
+    /**
+     * @notice Exponential backoff tracking
+     * @dev Counts deviations in rolling window to apply geometric penalty
+     */
+    
+    /// @notice Number of deviations detected in current backoff window
+    uint256 public deviationCount;
+    
+    /// @notice Block number when current backoff window started
+    uint256 public firstDeviationInWindow;
+    
+    /**
+     * @notice Rate caching for gas optimization
+     * @dev If called multiple times in same block with similar deviation, return cached
+     */
+    
+    /// @notice Block number of last getRate() call
+    uint256 public lastRateBlock;
+    
+    /// @notice Last rate value returned
+    uint256 public lastRateValue;
+    
+    /// @notice Last deviation value calculated (basis points)
+    uint256 public lastRateDeviation;
+    
+    // ============ REENTRANCY GUARD ============
+    
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+    uint256 private _status;
+
+    // ============ EVENTS ============
+    
+    /// @notice Emitted when price deviation detected and protection activated
+    event DeviationDetected(
+        uint256 indexed level,      // 1=moderate, 2=severe
+        uint256 deviation,          // Deviation in basis points
+        uint256 cooldownUntil,      // Block when cooldown expires
+        uint256 backoffMultiplier   // Current backoff multiplier applied
+    );
+    
+    /// @notice Emitted when backoff window expires and counters reset
+    event BackoffReset(uint256 blockNumber);
+    
+    /// @notice Emitted when owner proposes threshold update (starts timelock)
+    event ThresholdsProposed(
+        uint256 warnBuy,
+        uint256 warnSell,
+        uint256 moderateBuy,
+        uint256 moderateSell,
+        uint256 severe,
+        uint256 effectiveBlock
+    );
+    
+    /// @notice Emitted when threshold update executed after timelock
+    event ThresholdsUpdated(
+        uint256 warnBuy,
+        uint256 warnSell,
+        uint256 moderateBuy,
+        uint256 moderateSell,
+        uint256 severe
+    );
+    
+    /// @notice Emitted when pending threshold update cancelled
+    event ThresholdUpdateCancelled();
+    
+    /// @notice Emitted when cooldown durations updated
+    event CooldownsUpdated(uint256 moderate, uint256 severe);
+    
+    /// @notice Emitted when Chainlink staleness threshold updated
+    event ChainlinkStalenessThresholdUpdated(uint256 threshold);
+    
+    /// @notice Emitted when ownership transferred
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    // ============ CONSTRUCTOR ============
+    
+    /**
+     * @notice Initialize rate provider with Chainlink oracle validation
+     * @dev Validates oracle decimals and calculates scaling factor
+     */
+
+    constructor() {
+        // Validate Chainlink oracle configuration
+        IChainlinkOracle oracle = IChainlinkOracle(WETH_CHAINLINK_ORACLE);
+        require(WETH_CHAINLINK_ORACLE != address(0), "Invalid oracle address");
+        
+        // Get oracle decimals and validate (must be <= 18)
+        uint8 decimals = oracle.decimals();
+        require(decimals <= 18, "Invalid oracle decimals");
+        
+        // Calculate scaling factor to normalize to 18 decimals
+        // Example: Chainlink 8 decimals → scaling factor = 10^10
+        chainlinkDecimalScalingFactor = 10 ** (18 - decimals);
+        
+        // Set deployer as owner
+        owner = msg.sender;
+        
+        // Initialize reentrancy guard
+        _status = NOT_ENTERED;
+        
+        emit OwnershipTransferred(address(0), msg.sender);
+    }
+
+    // ============ MODIFIERS ============
+    
+    /// @notice Restricts function to contract owner
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Unauthorized");
+        _;
+    }
+    
+    /// @notice Prevents reentrancy attacks
+    modifier nonReentrant() {
+        require(_status != ENTERED, "ReentrancyGuard");
+        _status = ENTERED;
+        _;
+        _status = NOT_ENTERED;
+    }
+
+    // ============ ADMIN FUNCTIONS ============
+    
+    /**
+     * @notice Transfer ownership to new address
+     * @param newOwner Address of new owner (cannot be zero address)
+     */
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "zero address");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
+    /**
+     * @notice Propose threshold update (starts timelock)
+     * @dev Requires THRESHOLD_UPDATE_DELAY blocks before execution
+     * @param _warnBuy Warning threshold when WETH being bought (basis points)
+     * @param _warnSell Warning threshold when WETH being sold (basis points)
+     * @param _moderateBuy Moderate threshold when buying (basis points)
+     * @param _moderateSell Moderate threshold when selling (basis points)
+     * @param _severe Severe threshold (basis points, symmetric)
+     * 
+     * Requirements:
+     * - Thresholds must be increasing: warn < moderate < severe
+     * - Severe threshold max 50% (5000 bps)
+     * - Warn thresholds min 0.1% (10 bps)
+     */
+
+    function proposeThresholdUpdate(uint256 _warnBuy, uint256 _warnSell, uint256 _moderateBuy, uint256 _moderateSell, uint256 _severe) external onlyOwner {
+        // Validate threshold ordering (must be increasing)
+        require(_warnBuy < _moderateBuy && _moderateBuy < _severe, "invalid buy thresholds");
+        require(_warnSell < _moderateSell && _moderateSell < _severe, "invalid sell thresholds");
+        
+        // Validate bounds
+        require(_severe <= 5000, "severe threshold too high"); // Max 50%
+        require(_warnBuy >= 10 && _warnSell >= 10, "warn thresholds too low"); // Min 0.1%
+        
+        // Calculate effective block (current + delay)
+        uint256 effectiveBlock = block.number + THRESHOLD_UPDATE_DELAY;
+        
+        // Store pending update
+        pendingThresholds = PendingThresholds({
+            warnBuy: _warnBuy,
+            warnSell: _warnSell,
+            moderateBuy: _moderateBuy,
+            moderateSell: _moderateSell,
+            severe: _severe,
+            effectiveBlock: effectiveBlock
+        });
+        hasPendingThresholds = true;
+        
+        emit ThresholdsProposed(_warnBuy, _warnSell, _moderateBuy, _moderateSell, _severe, effectiveBlock);
+    }
+    
+    /**
+     * @notice Execute pending threshold update after timelock expires
+     * @dev Can be called by anyone once timelock expired (prevents owner censorship)
+     * 
+     * Requirements:
+     * - Must have pending update
+     * - Timelock must be expired (block.number >= effectiveBlock)
+     */
+    
+    function executeThresholdUpdate() external {
+        require(hasPendingThresholds, "no pending update");
+        require(block.number >= pendingThresholds.effectiveBlock, "timelock not expired");
+        
+        // Apply new thresholds
+        deviationWarnBuy = pendingThresholds.warnBuy;
+        deviationWarnSell = pendingThresholds.warnSell;
+        deviationModerateBuy = pendingThresholds.moderateBuy;
+        deviationModerateSell = pendingThresholds.moderateSell;
+        deviationSevere = pendingThresholds.severe;
+        
+        emit ThresholdsUpdated(
+            pendingThresholds.warnBuy,
+            pendingThresholds.warnSell,
+            pendingThresholds.moderateBuy,
+            pendingThresholds.moderateSell,
+            pendingThresholds.severe
+        );
+        
+        // Clear pending state
+        hasPendingThresholds = false;
+        delete pendingThresholds;
+    }
+    
+    /**
+     * @notice Cancel pending threshold update
+     * @dev Only owner can cancel before timelock expires
+     */
+    function cancelThresholdUpdate() external onlyOwner {
+        require(hasPendingThresholds, "no pending update");
+        hasPendingThresholds = false;
+        delete pendingThresholds;
+        emit ThresholdUpdateCancelled();
+    }
+
+    /**
+     * @notice Update cooldown durations
+     * @param _moderate Cooldown after moderate deviation (blocks)
+     * @param _severe Cooldown after severe deviation (blocks)
+     * 
+     * Requirements:
+     * - Both must be > 0
+     * - Moderate max 500 blocks (~100 min)
+     * - Severe max 1000 blocks (~200 min)
+     */
+    function updateCooldowns(uint256 _moderate, uint256 _severe) external onlyOwner {
+        require(_moderate > 0 && _severe > 0, "invalid cooldowns");
+        require(_moderate <= 500 && _severe <= 1000, "cooldowns too long");
+        
+        cooldownBlocksModerate = _moderate;
+        cooldownBlocksSevere = _severe;
+        
+        emit CooldownsUpdated(_moderate, _severe);
+    }
+
+    /**
+     * @notice Update Chainlink price staleness threshold
+     * @param _threshold Maximum age in seconds before price considered stale
+     * 
+     * Requirements:
+     * - Must be > 0
+     */
+    function updateChainlinkStalenessThreshold(uint256 _threshold) external onlyOwner {
+        require(_threshold > 0, "invalid threshold");
+        chainlinkStalenessThreshold = _threshold;
+        emit ChainlinkStalenessThresholdUpdated(_threshold);
+    }
+
+    // ============ CORE RATE PROVIDER FUNCTION ============
+    
+    /**
+     * @notice Get WETH rate with manipulation protection
+     * @return rate WETH/USDC rate normalized to 18 decimals
+     * 
+     * PROTECTION FLOW:
+     * 1. Fetch Uniswap TWAP (30s) and Chainlink price
+     * 2. Calculate deviation between them
+     * 3. Return cached rate if called again in same block (gas optimization)
+     * 4. Check if in cooldown from previous deviation → return cached Chainlink
+     * 5. Apply graduated response based on deviation severity:
+     *    - Normal (<30-50bps): Return TWAP
+     *    - Warning (30-90bps): Blend TWAP + Chainlink (70-80% / 20-30%)
+     *    - Moderate (60-90bps): Return Chainlink, enter cooldown
+     *    - Severe (>150bps): Revert transaction
+     * 
+     * ASYMMETRIC THRESHOLDS:
+     * - Stricter when TWAP > Chainlink (WETH being bought = pool vulnerable)
+     * - Looser when TWAP < Chainlink (WETH being sold = less risk)
+     * 
+     * EXPONENTIAL BACKOFF:
+     * - Tracks deviations in 300-block window
+     * - Multiplies cooldown: 1x → 2x → 3x → 4x (max)
+     * - Prevents repeated attacks from draining pool
+     */
+
+    function getRate() external override nonReentrant returns (uint256) {
+        // Step 1: Fetch both oracle prices
+        uint256 wethUsdcTwapRate = getWethUsdcUniV3TwapRate();
+        uint256 wethUsdChainlinkRate = getWethUsdChainlinkRate();
+
+        // Step 2: Calculate deviation in basis points
+        // Formula: |twap - chainlink| / chainlink * 10000
+        uint256 deviation;
+        bool twapAboveChainlink;
+        
+        if (wethUsdcTwapRate > wethUsdChainlinkRate) {
+            // TWAP higher = WETH being bought out = vulnerable state
+            deviation = ((wethUsdcTwapRate - wethUsdChainlinkRate) * 10000) / wethUsdChainlinkRate;
+            twapAboveChainlink = true;
+        } else {
+            // TWAP lower = WETH being sold = less vulnerable
+            deviation = ((wethUsdChainlinkRate - wethUsdcTwapRate) * 10000) / wethUsdChainlinkRate;
+            twapAboveChainlink = false;
+        }
+        
+        // Step 3: Rate caching - gas optimization for multiple calls in same block
+        // If deviation changed <5 bps, return cached rate (saves ~10-15k gas)
+        if (block.number == lastRateBlock) {
+            uint256 deviationDiff = deviation > lastRateDeviation 
+                ? deviation - lastRateDeviation 
+                : lastRateDeviation - deviation;
+            
+            if (deviationDiff <= 5) {
+                return lastRateValue;
+            }
+        }
+
+        // Step 4: Exponential backoff window management
+        // Reset counters if window expired (300 blocks = ~1 hour)
+        if (firstDeviationInWindow > 0 && block.number > firstDeviationInWindow + BACKOFF_WINDOW) {
+            deviationCount = 0;
+            firstDeviationInWindow = 0;
+        }
+
+        // Step 5: Check if currently in cooldown from previous deviation
+        if (lastDeviationBlock > 0) {
+            // Determine base cooldown duration
+            uint256 cooldownBlocks = lastDeviationLevel == 2 
+                ? cooldownBlocksSevere 
+                : cooldownBlocksModerate;
+            
+            // Apply exponential backoff multiplier (1x, 2x, 3x, 4x)
+            uint256 backoffMultiplier = deviationCount > MAX_BACKOFF_MULTIPLIER 
+                ? MAX_BACKOFF_MULTIPLIER 
+                : deviationCount;
+            
+            if (backoffMultiplier > 1) {
+                // Cap at 4000 blocks (~13 hours max cooldown)
+                uint256 newCooldown = cooldownBlocks * backoffMultiplier;
+                cooldownBlocks = newCooldown > 4000 ? 4000 : newCooldown;
+            }
+            
+            // Check if still in cooldown
+            if (block.number < lastDeviationBlock + cooldownBlocks) {
+                // Return cached Chainlink rate from last deviation event
+                return cachedSafeRate;
+            } else {
+                // Cooldown expired - reset state
+                lastDeviationBlock = 0;
+                lastDeviationLevel = 0;
+                cachedSafeRate = 0;
+                emit BackoffReset(block.number);
+            }
+        }
+
+        // Step 6: Graduated response based on deviation severity
+        // Select thresholds based on direction (asymmetric protection)
+        uint256 deviationWarn = twapAboveChainlink ? deviationWarnBuy : deviationWarnSell;
+        uint256 deviationModerate = twapAboveChainlink ? deviationModerateBuy : deviationModerateSell;
+        
+        if (deviation > deviationSevere) {
+            // SEVERE (>150 bps): Revert transaction entirely
+            revert("PriceDeviationTooHigh");
+            
+        } else if (deviation > deviationModerate) {
+            // MODERATE (60-90 bps): Use Chainlink only, enter cooldown
+            uint256 rate = _recordDeviation(1, deviation, twapAboveChainlink);
+            _updateCache(rate, deviation);
+            return rate;
+            
+        } else if (deviation > deviationWarn) {
+            // WARNING (30-50 bps): Blend TWAP + Chainlink with confidence weighting
+            uint256 rate = _getBlendedRate(wethUsdcTwapRate, wethUsdChainlinkRate);
+            _updateCache(rate, deviation);
+            return rate;
+            
+        } else {
+            // NORMAL (<30-50 bps): Return TWAP (cheapest, most accurate for small deviations)
+            _updateCache(wethUsdcTwapRate, deviation);
+            return wethUsdcTwapRate;
+        }
+    }
+    
+    // ============ INTERNAL HELPER FUNCTIONS ============
+    
+    /**
+     * @notice Update rate cache for gas optimization
+     * @param rate Rate value to cache
+     * @param deviation Deviation value in basis points
+     */
+    
+    function _updateCache(uint256 rate, uint256 deviation) private {
+        lastRateBlock = block.number;
+        lastRateValue = rate;
+        lastRateDeviation = deviation;
+    }
+    
+    /**
+     * @notice Calculate blended rate with dynamic Chainlink weighting
+     * @param twapRate Uniswap TWAP rate
+     * @param chainlinkRate Chainlink rate
+     * @return Blended rate (70-80% TWAP, 20-30% Chainlink based on staleness)
+     * 
+     * CONFIDENCE WEIGHTING:
+     * - Fresh Chainlink (0s old): 30% weight
+     * - Stale Chainlink (3600s old): 20% weight
+     * - Linear interpolation between
+     * 
+     * RATIONALE:
+     * Fresher prices are more accurate, so give them more weight in blend
+     */
+    function _getBlendedRate(uint256 twapRate, uint256 chainlinkRate) private view returns (uint256) {
+        // Fetch Chainlink update timestamp
+        IChainlinkOracle oracle = IChainlinkOracle(WETH_CHAINLINK_ORACLE);
+        (, , , uint256 updatedAt, ) = oracle.latestRoundData();
+        uint256 staleness = block.timestamp - updatedAt;
+        
+        // Calculate dynamic Chainlink weight (2000-3000 bps = 20-30%)
+        uint256 chainlinkWeight;
+        if (staleness >= chainlinkStalenessThreshold) {
+            // At staleness threshold: use minimum weight (20%)
+            chainlinkWeight = BLEND_CHAINLINK_WEIGHT;
+        } else {
+            // Linear scaling: 2000 + (1000 * (3600 - staleness) / 3600)
+            // Example: 0s old = 2000 + 1000 = 3000 (30%)
+            //          1800s old = 2000 + 500 = 2500 (25%)
+            //          3600s old = 2000 + 0 = 2000 (20%)
+            chainlinkWeight = BLEND_CHAINLINK_WEIGHT + 
+                (1000 * (chainlinkStalenessThreshold - staleness) / chainlinkStalenessThreshold);
+        }
+        
+        // Calculate TWAP weight (remaining percentage)
+        uint256 twapWeight = BLEND_DIVISOR - chainlinkWeight;
+        
+        // Return weighted average
+        return (twapRate * twapWeight + chainlinkRate * chainlinkWeight) / BLEND_DIVISOR;
+    }
+
+    /**
+     * @notice Record deviation event and enter cooldown
+     * @param level Severity level (1=moderate, 2=severe)
+     * @param deviation Deviation in basis points
+     * @param twapAbove Whether TWAP is above Chainlink (indicates direction)
+     * @return Chainlink rate to use during cooldown
+     * 
+     * EXPONENTIAL BACKOFF:
+     * - First deviation in window: multiplier = 1x
+     * - Second deviation: multiplier = 2x
+     * - Third deviation: multiplier = 3x
+     * - Fourth+ deviation: multiplier = 4x (capped)
+     * 
+     * Example with 75-block moderate cooldown:
+     * 1st attack: 75 blocks (~15 min)
+     * 2nd attack: 150 blocks (~30 min)
+     * 3rd attack: 225 blocks (~45 min)
+     * 4th+ attack: 300 blocks (~60 min)
+     */
+
+    function _recordDeviation(uint256 level, uint256 deviation, bool twapAbove) private returns (uint256) {
+        // Initialize or increment deviation counter for exponential backoff
+        if (firstDeviationInWindow == 0) {
+            // First deviation in new window
+            firstDeviationInWindow = block.number;
+            deviationCount = 1;
+        } else {
+            // Additional deviation in existing window
+            deviationCount++;
+        }
+
+        // Record deviation state
+        lastDeviationBlock = block.number;
+        lastDeviationLevel = level;
+        
+        // Fetch and cache Chainlink rate for cooldown period
+        uint256 safeRate = getWethUsdChainlinkRate();
+        cachedSafeRate = safeRate;
+        
+        // Calculate cooldown with exponential backoff
+        uint256 cooldownBlocks = level == 2 ? cooldownBlocksSevere : cooldownBlocksModerate;
+        uint256 backoffMultiplier = deviationCount > MAX_BACKOFF_MULTIPLIER 
+            ? MAX_BACKOFF_MULTIPLIER 
+            : deviationCount;
+        
+        if (backoffMultiplier > 1) {
+            uint256 newCooldown = cooldownBlocks * backoffMultiplier;
+            // Cap at 4000 blocks (~13 hours) to prevent indefinite lockout
+            cooldownBlocks = newCooldown > 4000 ? 4000 : newCooldown;
+        }
+        
+        emit DeviationDetected(level, deviation, block.number + cooldownBlocks, backoffMultiplier);
+        return safeRate;
+    }
+
+    // ============ ORACLE FUNCTIONS ============
+    
+    /**
+     * @notice Get WETH price from Chainlink oracle
+     * @return WETH/USD price normalized to 18 decimals
+     * 
+     * VALIDATION:
+     * - Checks price staleness (reverts if > chainlinkStalenessThreshold old)
+     * - Validates price > 0
+     */
+    function getWethUsdChainlinkRate() public view returns (uint256) {
+        IChainlinkOracle oracle = IChainlinkOracle(WETH_CHAINLINK_ORACLE);
+        (, int256 answer, , uint256 updatedAt, ) = oracle.latestRoundData();
+        
+        // Validate freshness
+        require(block.timestamp <= updatedAt + chainlinkStalenessThreshold, "ChainlinkStale");
+        
+        // Validate price validity
+        require(answer > 0, "Invalid Chainlink price");
+        
+        // Normalize to 18 decimals
+        return uint256(answer) * chainlinkDecimalScalingFactor;
+    }
+
+    /**
+     * @notice Get WETH/USDC price from Uniswap V3 TWAP
+     * @return WETH/USDC price normalized to 18 decimals
+     * 
+     * TWAP CALCULATION:
+     * - Uses 30-second time-weighted average
+     * - Queries Uniswap V3 pool on Sonic network
+     * - Manipulation-resistant (requires sustained price for 30+ seconds)
+     */
+    function getWethUsdcUniV3TwapRate() public view returns (uint256) {
+        // Query 30-second TWAP from Uniswap V3 pool
+        (int24 arithmeticMeanTick,) = OracleLibrary.consult(address(WETH_POOL), TWAP_INTERVAL);
+        
+        // Convert tick to quote amount (1 WETH = X USDC)
+        uint256 quoteAmount = OracleLibrary.getQuoteAtTick(
+            arithmeticMeanTick,
+            uint128(1e18), // 1 WETH
+            WETH,
+            USDC
+        );
+
+        // Scale from USDC decimals (6) to standard 18 decimals
+        // Example: 3300 USDC (6 decimals) = 3300000000 (raw)
+        //          → 3300000000 * 1e12 = 3300000000000000000000 (18 decimals)
+        return quoteAmount * 1e12;
+    }
+}
