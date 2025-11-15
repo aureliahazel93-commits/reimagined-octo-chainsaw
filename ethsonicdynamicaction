@@ -74,6 +74,9 @@ contract WETHRateProvider is IRateProvider {
     PendingThresholds public pendingThresholds;
     bool public hasPendingThresholds;
     
+    /// @notice Block number of last threshold proposal (prevents proposal spam)
+    uint256 public lastProposalBlock;
+    
     // ============ DEVIATION THRESHOLDS (Basis Points) ============
     
     /**
@@ -129,10 +132,16 @@ contract WETHRateProvider is IRateProvider {
     /// @notice Maximum cooldown multiplier (caps at 4x)
     uint256 public constant MAX_BACKOFF_MULTIPLIER = 4;
     
+    /// @notice Maximum cooldown duration in blocks (~13.3 hours at 12s blocks)
+    uint256 public constant MAX_COOLDOWN_BLOCKS = 4000;
+    
     // ============ CHAINLINK CONFIGURATION ============
     
     /// @notice Maximum age of Chainlink price before considered stale (1 hour)
     uint256 public chainlinkStalenessThreshold = 3600;
+    
+    /// @notice Cached Chainlink oracle instance for gas optimization
+    IChainlinkOracle private immutable chainlinkOracle;
     
     // ============ STATE VARIABLES ============
     
@@ -234,11 +243,11 @@ contract WETHRateProvider is IRateProvider {
 
     constructor() {
         // Validate Chainlink oracle configuration
-        IChainlinkOracle oracle = IChainlinkOracle(WETH_CHAINLINK_ORACLE);
         require(WETH_CHAINLINK_ORACLE != address(0), "Invalid oracle address");
+        chainlinkOracle = IChainlinkOracle(WETH_CHAINLINK_ORACLE);
         
         // Get oracle decimals and validate (must be <= 18)
-        uint8 decimals = oracle.decimals();
+        uint8 decimals = chainlinkOracle.decimals();
         require(decimals <= 18, "Invalid oracle decimals");
         
         // Calculate scaling factor to normalize to 18 decimals
@@ -299,6 +308,9 @@ contract WETHRateProvider is IRateProvider {
      */
 
     function proposeThresholdUpdate(uint256 _warnBuy, uint256 _warnSell, uint256 _moderateBuy, uint256 _moderateSell, uint256 _severe) external onlyOwner {
+        // Prevent proposal spam - must wait at least THRESHOLD_UPDATE_DELAY between proposals
+        require(block.number >= lastProposalBlock + THRESHOLD_UPDATE_DELAY, "proposal cooldown active");
+        
         // Validate threshold ordering (must be increasing)
         require(_warnBuy < _moderateBuy && _moderateBuy < _severe, "invalid buy thresholds");
         require(_warnSell < _moderateSell && _moderateSell < _severe, "invalid sell thresholds");
@@ -320,6 +332,7 @@ contract WETHRateProvider is IRateProvider {
             effectiveBlock: effectiveBlock
         });
         hasPendingThresholds = true;
+        lastProposalBlock = block.number;
         
         emit ThresholdsProposed(_warnBuy, _warnSell, _moderateBuy, _moderateSell, _severe, effectiveBlock);
     }
@@ -369,24 +382,13 @@ contract WETHRateProvider is IRateProvider {
     }
 
     /**
-     * @notice Update cooldown durations
-     * @param _moderate Cooldown after moderate deviation (blocks)
-     * @param _severe Cooldown after severe deviation (blocks)
+     * @notice Update cooldown durations (IMMUTABLE - removed for security)
+     * @dev Cooldown values are now constants set at deployment
+     *      This prevents owner from bypassing protection by setting cooldowns to 0
      * 
-     * Requirements:
-     * - Both must be > 0
-     * - Moderate max 500 blocks (~100 min)
-     * - Severe max 1000 blocks (~200 min)
+     * NOTE: Function removed - cooldowns are immutable constants
      */
-    function updateCooldowns(uint256 _moderate, uint256 _severe) external onlyOwner {
-        require(_moderate > 0 && _severe > 0, "invalid cooldowns");
-        require(_moderate <= 500 && _severe <= 1000, "cooldowns too long");
-        
-        cooldownBlocksModerate = _moderate;
-        cooldownBlocksSevere = _severe;
-        
-        emit CooldownsUpdated(_moderate, _severe);
-    }
+    // function updateCooldowns() - REMOVED FOR SECURITY
 
     /**
      * @notice Update Chainlink price staleness threshold
@@ -394,9 +396,11 @@ contract WETHRateProvider is IRateProvider {
      * 
      * Requirements:
      * - Must be > 0
+     * - Must be <= 86400 (24 hours) to prevent accepting stale prices
      */
     function updateChainlinkStalenessThreshold(uint256 _threshold) external onlyOwner {
         require(_threshold > 0, "invalid threshold");
+        require(_threshold <= 86400, "threshold too high"); // Max 24 hours
         chainlinkStalenessThreshold = _threshold;
         emit ChainlinkStalenessThresholdUpdated(_threshold);
     }
@@ -480,15 +484,20 @@ contract WETHRateProvider is IRateProvider {
                 : deviationCount;
             
             if (backoffMultiplier > 1) {
-                // Cap at 4000 blocks (~13 hours max cooldown)
+                // Use overflow-safe multiplication with capping
                 uint256 newCooldown = cooldownBlocks * backoffMultiplier;
-                cooldownBlocks = newCooldown > 4000 ? 4000 : newCooldown;
+                // Verify no overflow occurred (result should be >= original)
+                require(newCooldown >= cooldownBlocks, "cooldown overflow");
+                cooldownBlocks = newCooldown > MAX_COOLDOWN_BLOCKS ? MAX_COOLDOWN_BLOCKS : newCooldown;
             }
             
             // Check if still in cooldown
             if (block.number < lastDeviationBlock + cooldownBlocks) {
-                // Return cached Chainlink rate from last deviation event
-                return cachedSafeRate;
+                // REFRESH CHAINLINK: Fetch fresh price instead of using stale cached rate
+                // This prevents arbitrage if Chainlink price moved significantly during cooldown
+                uint256 freshRate = getWethUsdChainlinkRate();
+                cachedSafeRate = freshRate; // Update cache with fresh price
+                return freshRate;
             } else {
                 // Cooldown expired - reset state
                 lastDeviationBlock = 0;
@@ -509,7 +518,7 @@ contract WETHRateProvider is IRateProvider {
             
         } else if (deviation > deviationModerate) {
             // MODERATE (60-90 bps): Use Chainlink only, enter cooldown
-            uint256 rate = _recordDeviation(1, deviation, twapAboveChainlink);
+            uint256 rate = _recordDeviation(1, deviation);
             _updateCache(rate, deviation);
             return rate;
             
@@ -555,9 +564,8 @@ contract WETHRateProvider is IRateProvider {
      * Fresher prices are more accurate, so give them more weight in blend
      */
     function _getBlendedRate(uint256 twapRate, uint256 chainlinkRate) private view returns (uint256) {
-        // Fetch Chainlink update timestamp
-        IChainlinkOracle oracle = IChainlinkOracle(WETH_CHAINLINK_ORACLE);
-        (, , , uint256 updatedAt, ) = oracle.latestRoundData();
+        // Fetch Chainlink update timestamp (use cached oracle instance)
+        (, , , uint256 updatedAt, ) = chainlinkOracle.latestRoundData();
         uint256 staleness = block.timestamp - updatedAt;
         
         // Calculate dynamic Chainlink weight (2000-3000 bps = 20-30%)
@@ -585,7 +593,6 @@ contract WETHRateProvider is IRateProvider {
      * @notice Record deviation event and enter cooldown
      * @param level Severity level (1=moderate, 2=severe)
      * @param deviation Deviation in basis points
-     * @param twapAbove Whether TWAP is above Chainlink (indicates direction)
      * @return Chainlink rate to use during cooldown
      * 
      * EXPONENTIAL BACKOFF:
@@ -601,7 +608,7 @@ contract WETHRateProvider is IRateProvider {
      * 4th+ attack: 300 blocks (~60 min)
      */
 
-    function _recordDeviation(uint256 level, uint256 deviation, bool twapAbove) private returns (uint256) {
+    function _recordDeviation(uint256 level, uint256 deviation) private returns (uint256) {
         // Initialize or increment deviation counter for exponential backoff
         if (firstDeviationInWindow == 0) {
             // First deviation in new window
@@ -628,8 +635,10 @@ contract WETHRateProvider is IRateProvider {
         
         if (backoffMultiplier > 1) {
             uint256 newCooldown = cooldownBlocks * backoffMultiplier;
-            // Cap at 4000 blocks (~13 hours) to prevent indefinite lockout
-            cooldownBlocks = newCooldown > 4000 ? 4000 : newCooldown;
+            // Verify no overflow occurred
+            require(newCooldown >= cooldownBlocks, "cooldown overflow");
+            // Cap at MAX_COOLDOWN_BLOCKS to prevent indefinite lockout
+            cooldownBlocks = newCooldown > MAX_COOLDOWN_BLOCKS ? MAX_COOLDOWN_BLOCKS : newCooldown;
         }
         
         emit DeviationDetected(level, deviation, block.number + cooldownBlocks, backoffMultiplier);
@@ -647,8 +656,8 @@ contract WETHRateProvider is IRateProvider {
      * - Validates price > 0
      */
     function getWethUsdChainlinkRate() public view returns (uint256) {
-        IChainlinkOracle oracle = IChainlinkOracle(WETH_CHAINLINK_ORACLE);
-        (, int256 answer, , uint256 updatedAt, ) = oracle.latestRoundData();
+        // Use cached oracle instance for gas optimization
+        (, int256 answer, , uint256 updatedAt, ) = chainlinkOracle.latestRoundData();
         
         // Validate freshness
         require(block.timestamp <= updatedAt + chainlinkStalenessThreshold, "ChainlinkStale");
@@ -685,5 +694,44 @@ contract WETHRateProvider is IRateProvider {
         // Example: 3300 USDC (6 decimals) = 3300000000 (raw)
         //          → 3300000000 * 1e12 = 3300000000000000000000 (18 decimals)
         return quoteAmount * 1e12;
+    }
+    
+    // ============ VIEW FUNCTIONS ============
+    
+    /**
+     * @notice Get current cooldown status
+     * @return inCooldown Whether currently in cooldown period
+     * @return cooldownEndsAt Block number when cooldown expires (0 if not in cooldown)
+     * @return deviationLevel Severity of last deviation (0=none, 1=moderate, 2=severe)
+     * @return backoffMultiplier Current exponential backoff multiplier
+     */
+    function getCooldownStatus() external view returns (
+        bool inCooldown,
+        uint256 cooldownEndsAt,
+        uint256 deviationLevel,
+        uint256 backoffMultiplier
+    ) {
+        if (lastDeviationBlock == 0) {
+            return (false, 0, 0, 0);
+        }
+        
+        // Calculate cooldown duration with backoff
+        uint256 cooldownBlocks = lastDeviationLevel == 2 
+            ? cooldownBlocksSevere 
+            : cooldownBlocksModerate;
+        
+        uint256 multiplier = deviationCount > MAX_BACKOFF_MULTIPLIER 
+            ? MAX_BACKOFF_MULTIPLIER 
+            : deviationCount;
+        
+        if (multiplier > 1) {
+            uint256 newCooldown = cooldownBlocks * multiplier;
+            cooldownBlocks = newCooldown > MAX_COOLDOWN_BLOCKS ? MAX_COOLDOWN_BLOCKS : newCooldown;
+        }
+        
+        uint256 endsAt = lastDeviationBlock + cooldownBlocks;
+        bool active = block.number < endsAt;
+        
+        return (active, endsAt, lastDeviationLevel, multiplier);
     }
 }
